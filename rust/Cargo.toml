@@ -1,0 +1,15 @@
+[package]
+name = "jcat"
+version = "0.1.0"
+edition = "2024"
+description = "Readable JSONL viewer"
+license = "MIT"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
