@@ -11,6 +11,8 @@ go build -trimpath -ldflags '-s -w' -o jcat-go .
 
 `--plain` forces formatter mode; `--interactive` requires a named file and terminal input/output. In the inspector, `/` searches the focused pane, `Enter` applies a record filter, `Tab` changes focus, and `r` toggles fields/raw JSON. `j`/`k` or arrows navigate, `n`/`N` visit matches, `?` opens help, and `q` exits. Search is case-insensitive literal text.
 
+Both implementations render Markdown and XML inside JSONL string fields in the inspector. Fields with recognizable Markdown syntax show formatted headings, emphasis, lists, and code. Fields containing XML show highlighted tags and indented elements, with mixed text and `xml:space` preserved. Press `r` to inspect the original strings in raw JSON.
+
 The Rust Ratatui implementation is available in [`rust/`](rust/). Build and run it with:
 
 ```sh

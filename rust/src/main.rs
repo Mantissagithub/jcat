@@ -1,3 +1,4 @@
+mod documents;
 mod tui;
 
 use std::env;

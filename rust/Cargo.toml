@@ -10,6 +10,10 @@ serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision
 crossterm = "0.29"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2"
+termimad = "0.35.5"
+quick-xml = "0.39"
+ansi-to-tui = "8.0.1"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"

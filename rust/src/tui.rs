@@ -42,6 +42,7 @@ struct DisplayLine {
     label: String,
     label_width: usize,
     value: String,
+    styled: Vec<Span<'static>>,
     kind: ValueKind,
     search_text: Arc<str>,
     source_id: usize,
@@ -161,6 +162,7 @@ fn load_record(
                     label: String::new(),
                     label_width: 0,
                     value: line.to_owned(),
+                    styled: Vec::new(),
                     kind: ValueKind::Raw,
                     search_text: Arc::from(line.to_owned()),
                     source_id: index + 1,
@@ -190,6 +192,7 @@ fn display_fields(value: &serde_json::Value, width: usize) -> Vec<DisplayLine> {
             label: String::new(),
             label_width: 0,
             value: "Empty object".into(),
+            styled: Vec::new(),
             kind: ValueKind::Section,
             search_text: Arc::from("Empty object"),
             source_id: 0,
@@ -236,6 +239,7 @@ fn append_object(
                     label_width: UnicodeWidthStr::width(segment.as_str()),
                     label: segment,
                     value: String::new(),
+                    styled: Vec::new(),
                     kind: ValueKind::Key,
                     search_text: Arc::clone(&shared),
                     source_id: *sequence,
@@ -269,6 +273,7 @@ fn append_value(
                 label: label.to_owned(),
                 label_width,
                 value,
+                styled: Vec::new(),
                 kind,
                 search_text: Arc::from(search_text),
                 source_id,
@@ -339,6 +344,16 @@ fn append_value(
                     0,
                     0,
                 );
+            } else if let Some(rendered) = crate::documents::render_field(text) {
+                append_rendered_field(
+                    lines,
+                    label,
+                    depth,
+                    label_width,
+                    value_width,
+                    source_id,
+                    rendered,
+                );
             } else {
                 let safe = safe_text(text);
                 let shared: Arc<str> = Arc::from(safe.as_str());
@@ -353,6 +368,7 @@ fn append_value(
                         },
                         label_width,
                         value: segment,
+                        styled: Vec::new(),
                         kind: ValueKind::String,
                         search_text: Arc::clone(&shared),
                         source_id,
@@ -377,6 +393,7 @@ fn append_value(
                     },
                     label_width,
                     value: segment,
+                    styled: Vec::new(),
                     kind: ValueKind::Number,
                     search_text: Arc::clone(&shared),
                     source_id,
@@ -403,7 +420,58 @@ fn append_value(
     }
 }
 
-fn safe_text(text: &str) -> String {
+fn append_rendered_field(
+    lines: &mut Vec<DisplayLine>,
+    mut label: &str,
+    depth: usize,
+    label_width: usize,
+    width: usize,
+    source_id: usize,
+    rendered: Text<'static>,
+) {
+    let plain: Vec<String> = rendered.lines.iter().map(ToString::to_string).collect();
+    let search_text: Arc<str> = Arc::from(plain.join("\n"));
+    let mut offset = 0;
+    for (row, line) in plain.iter().zip(rendered.lines) {
+        let mut spans = line.spans.into_iter().peekable();
+        let mut span_start = 0;
+        for (value, start, end) in wrap_segments(row, width) {
+            let mut styled = Vec::new();
+            while let Some(span) = spans.peek() {
+                let span_end = span_start + span.content.len();
+                let from = start.max(span_start);
+                let to = end.min(span_end);
+                if from < to {
+                    styled.push(Span::styled(
+                        span.content[from - span_start..to - span_start].to_owned(),
+                        span.style,
+                    ));
+                }
+                if span_end > end {
+                    break;
+                }
+                spans.next();
+                span_start = span_end;
+            }
+            lines.push(DisplayLine {
+                depth,
+                label: label.to_owned(),
+                label_width,
+                value,
+                styled,
+                kind: ValueKind::String,
+                search_text: Arc::clone(&search_text),
+                source_id,
+                start: offset + start,
+                end: offset + end,
+            });
+            label = "";
+        }
+        offset += row.len() + 1;
+    }
+}
+
+pub(super) fn safe_text(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     for character in text.chars() {
         match character {
@@ -1085,7 +1153,11 @@ fn draw(frame: &mut ratatui::Frame, state: &mut State) {
                                 } else {
                                     Style::default()
                                 };
-                                spans.push(Span::styled(item.value.clone(), value_style));
+                                if state.color && !item.styled.is_empty() {
+                                    spans.extend(item.styled.iter().cloned());
+                                } else {
+                                    spans.push(Span::styled(item.value.clone(), value_style));
+                                }
                             }
                         }
                     }
@@ -1378,6 +1450,57 @@ pub fn run(path: &Path, color: bool) -> Result<(), String> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn renders_embedded_documents_and_preserves_raw_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        let raw = r##"{"message":"# Report\n\n**Searchable** text\n\n- First","payload":"<root><node a=\"a>b\"/><p>See <b><c/></b> now &amp; forever.</p><keep xml:space=\"preserve\"><x/><y/></keep></root>","broken":"<a><b></a>","plain":"keep this text"}"##;
+        std::fs::write(&path, raw).unwrap();
+        let entries = index_file(&path).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let mut state = State::new(&path, entries, true);
+        state.inspector_width = 96;
+        state.update_selected(&mut file);
+        let rendered = state
+            .cached_lines
+            .iter()
+            .map(|line| line.value.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in [
+            "Report",
+            "Searchable text",
+            "• First",
+            "\n  <node",
+            "<p>See <b><c/></b> now &amp; forever.</p>",
+            "><x/><y/></keep>",
+            "<a><b></a>",
+            "keep this text",
+        ] {
+            assert!(
+                rendered.contains(want),
+                "missing {want:?} from {rendered:?}"
+            );
+        }
+        assert!(!rendered.contains("# Report") && !rendered.contains("**Searchable**"));
+        assert!(state.cached_lines.iter().any(|line| {
+            line.styled
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Cyan))
+        }));
+        state.right_query = Some("searchable text".into());
+        state.rebuild_search_lines();
+        assert_eq!(state.search_lines.len(), 1);
+        state.raw_mode = true;
+        state.update_selected(&mut file);
+        assert!(
+            state
+                .cached_lines
+                .iter()
+                .any(|line| line.value.contains(r"# Report\n\n**Searchable**"))
+        );
+    }
 
     #[test]
     fn index_filter_selection_and_inspector_search() {

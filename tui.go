@@ -686,6 +686,9 @@ func (m *model) rightPanel(width, height int) string {
 					line = indent + label
 				} else {
 					value := valueStyle(item.kind, m.color).Render(line)
+					if m.color && item.styled != "" {
+						value = item.styled
+					}
 					line = indent + label + strings.Repeat(" ", padding) + "  " + value
 				}
 			} else {

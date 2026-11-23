@@ -53,6 +53,7 @@ type displayLine struct {
 	label      string
 	labelWidth int
 	value      string
+	styled     string
 	kind       lineKind
 	searchText string
 	sourceID   int
@@ -203,6 +204,10 @@ func appendValue(lines *[]displayLine, label string, n *jsonNode, depth, labelWi
 			*lines = append(*lines, displayLine{depth: depth, label: label, labelWidth: labelWidth, value: "Empty string", kind: stringLine, searchText: "Empty string", sourceID: id, end: len("Empty string")})
 			return
 		}
+		if rendered := renderField(n.text); len(rendered) > 0 {
+			appendRenderedField(lines, label, depth, labelWidth, valueWidth, id, rendered)
+			return
+		}
 		text := safeText(n.text)
 		first := true
 		for _, segment := range wrapSegments(text, valueWidth) {
@@ -227,6 +232,28 @@ func appendValue(lines *[]displayLine, label string, n *jsonNode, depth, labelWi
 		*lines = append(*lines, displayLine{depth: depth, label: label, labelWidth: labelWidth, value: n.text, kind: boolLine, searchText: n.text, sourceID: id, end: len(n.text)})
 	case nullNode:
 		*lines = append(*lines, displayLine{depth: depth, label: label, labelWidth: labelWidth, value: "Null", kind: nullLine, searchText: "Null", sourceID: id, end: len("Null")})
+	}
+}
+
+func appendRenderedField(lines *[]displayLine, label string, depth, labelWidth, width, id int, rows []string) {
+	plain := make([]string, len(rows))
+	for i, row := range rows {
+		plain[i] = ansi.Strip(row)
+	}
+	search := strings.Join(plain, "\n")
+	offset := 0
+	for i, row := range rows {
+		segments := wrapSegments(plain[i], width)
+		styled := wrapStyles(row, segments)
+		for j, segment := range segments {
+			*lines = append(*lines, displayLine{
+				depth: depth, label: label, labelWidth: labelWidth, value: segment.text,
+				styled: styled[j], kind: stringLine, searchText: search,
+				sourceID: id, start: offset + segment.start, end: offset + segment.end,
+			})
+			label = ""
+		}
+		offset += len(plain[i]) + 1
 	}
 }
 
