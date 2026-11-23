@@ -48,6 +48,42 @@ struct DisplayLine {
     source_id: usize,
     start: usize,
     end: usize,
+    message_role: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum FieldPath {
+    Other,
+    Record,
+    Traces,
+    Trace,
+    Nodes,
+    Node,
+    Message,
+}
+
+impl FieldPath {
+    fn field(self, key: &str) -> Self {
+        match (self, key) {
+            (Self::Record, "traces") => Self::Traces,
+            (Self::Trace, "nodes") => Self::Nodes,
+            (Self::Node, "message") => Self::Message,
+            _ => Self::Other,
+        }
+    }
+
+    fn item(self) -> Self {
+        match self {
+            Self::Traces => Self::Trace,
+            Self::Nodes => Self::Node,
+            _ => Self::Other,
+        }
+    }
+}
+
+struct MessageAnchor {
+    row: usize,
+    role: String,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +125,7 @@ struct State {
     cached_width: usize,
     cached_entry: Option<usize>,
     cached_lines: Vec<DisplayLine>,
+    messages: Vec<MessageAnchor>,
     cached_error: Option<String>,
     search_lines: Vec<(usize, usize)>,
     search_cursor: usize,
@@ -168,6 +205,7 @@ fn load_record(
                     source_id: index + 1,
                     start: 0,
                     end: line.len(),
+                    message_role: None,
                 })
                 .collect(),
             None,
@@ -198,10 +236,16 @@ fn display_fields(value: &serde_json::Value, width: usize) -> Vec<DisplayLine> {
             source_id: 0,
             start: 0,
             end: 0,
+            message_role: None,
         }),
-        serde_json::Value::Object(object) => {
-            append_object(&mut lines, object, 0, width.max(18), &mut sequence)
-        }
+        serde_json::Value::Object(object) => append_object(
+            &mut lines,
+            object,
+            0,
+            width.max(18),
+            &mut sequence,
+            FieldPath::Record,
+        ),
         _ => append_value(
             &mut lines,
             "Value",
@@ -210,6 +254,7 @@ fn display_fields(value: &serde_json::Value, width: usize) -> Vec<DisplayLine> {
             8,
             width.max(18),
             &mut sequence,
+            FieldPath::Other,
         ),
     }
     lines
@@ -221,6 +266,7 @@ fn append_object(
     depth: usize,
     width: usize,
     sequence: &mut usize,
+    path: FieldPath,
 ) {
     let label_width = object
         .keys()
@@ -245,11 +291,21 @@ fn append_object(
                     source_id: *sequence,
                     start,
                     end,
+                    message_role: None,
                 });
             }
-            append_value(lines, "", value, depth, 0, width, sequence);
+            append_value(lines, "", value, depth, 0, width, sequence, path.field(key));
         } else {
-            append_value(lines, &label, value, depth, label_width, width, sequence);
+            append_value(
+                lines,
+                &label,
+                value,
+                depth,
+                label_width,
+                width,
+                sequence,
+                path.field(key),
+            );
         }
     }
 }
@@ -262,6 +318,7 @@ fn append_value(
     label_width: usize,
     width: usize,
     sequence: &mut usize,
+    path: FieldPath,
 ) {
     *sequence += 1;
     let source_id = *sequence;
@@ -279,6 +336,7 @@ fn append_value(
                 source_id,
                 start,
                 end,
+                message_role: None,
             });
         };
     match value {
@@ -300,7 +358,18 @@ fn append_value(
                     0,
                     0,
                 );
-                append_object(lines, object, depth + 1, width, sequence);
+                if matches!(path, FieldPath::Message)
+                    && let Some(role) = object.get("role").and_then(serde_json::Value::as_str)
+                {
+                    let role = safe_text(role)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !role.is_empty() {
+                        lines.last_mut().unwrap().message_role = Some(role);
+                    }
+                }
+                append_object(lines, object, depth + 1, width, sequence, path);
             }
         }
         serde_json::Value::Array(items) => {
@@ -331,6 +400,7 @@ fn append_value(
                         item_width,
                         width,
                         sequence,
+                        path.item(),
                     );
                 }
             }
@@ -374,6 +444,7 @@ fn append_value(
                         source_id,
                         start,
                         end,
+                        message_role: None,
                     });
                     first = false;
                 }
@@ -399,6 +470,7 @@ fn append_value(
                     source_id,
                     start,
                     end,
+                    message_role: None,
                 });
                 first = false;
             }
@@ -464,6 +536,7 @@ fn append_rendered_field(
                 source_id,
                 start: offset + start,
                 end: offset + end,
+                message_role: None,
             });
             label = "";
         }
@@ -554,6 +627,7 @@ impl State {
             cached_width: 0,
             cached_entry: None,
             cached_lines: Vec::new(),
+            messages: Vec::new(),
             cached_error: None,
             search_lines: Vec::new(),
             search_cursor: 0,
@@ -594,9 +668,31 @@ impl State {
         self.visible.get(self.selected).copied()
     }
     fn clamp_inspector(&mut self) {
-        self.inspector_scroll = self
-            .inspector_scroll
-            .min(self.cached_lines.len().saturating_sub(self.inspector_rows));
+        self.inspector_scroll = self.inspector_scroll.min(self.last_inspector_row());
+    }
+    fn last_inspector_row(&self) -> usize {
+        self.cached_lines
+            .len()
+            .saturating_sub(self.inspector_rows)
+            .max(self.messages.last().map_or(0, |message| message.row))
+    }
+    fn current_message(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .rposition(|message| message.row <= self.inspector_scroll)
+    }
+    fn jump_message(&mut self, forward: bool) {
+        let index = match self.current_message() {
+            Some(index) if forward => Some(index + 1),
+            Some(index) => index.checked_sub(1),
+            None if forward => Some(0),
+            None => None,
+        };
+        if let Some(message) = index.and_then(|index| self.messages.get(index)) {
+            self.inspector_scroll = message.row;
+            self.inspector_horizontal = 0;
+            self.focus = Focus::Inspector;
+        }
     }
     fn filter(&mut self, file: &mut File) -> io::Result<()> {
         let query = self.left_query.as_ref().map(|q| q.to_lowercase());
@@ -622,6 +718,7 @@ impl State {
         let Some(index) = self.selected_entry() else {
             self.cached_entry = None;
             self.cached_lines.clear();
+            self.messages.clear();
             self.cached_error = None;
             return;
         };
@@ -631,6 +728,12 @@ impl State {
         {
             return;
         }
+        let position = if self.cached_entry == Some(index) && self.cached_raw == self.raw_mode {
+            self.current_message()
+                .map(|message| (message, self.inspector_scroll - self.messages[message].row))
+        } else {
+            None
+        };
         self.cached_lines.clear();
         match load_record(
             file,
@@ -650,7 +753,28 @@ impl State {
         self.cached_entry = Some(index);
         self.cached_width = self.inspector_width;
         self.cached_raw = self.raw_mode;
+        self.messages = self
+            .cached_lines
+            .iter()
+            .enumerate()
+            .filter_map(|(row, line)| {
+                line.message_role.as_ref().map(|role| MessageAnchor {
+                    row,
+                    role: role.clone(),
+                })
+            })
+            .collect();
         self.rebuild_search_lines();
+        if let Some((index, offset)) = position
+            && let Some(message) = self.messages.get(index)
+        {
+            let end = self
+                .messages
+                .get(index + 1)
+                .map_or(self.cached_lines.len(), |next| next.row);
+            self.inspector_scroll = (message.row + offset).min(end - 1);
+            self.inspector_horizontal = 0;
+        }
     }
     fn rebuild_search_lines(&mut self) {
         self.search_lines.clear();
@@ -1037,6 +1161,14 @@ fn draw(frame: &mut ratatui::Frame, state: &mut State) {
     let mode = if state.raw_mode { "Raw JSON" } else { "Fields" };
     let right_title = selected
         .map(|e| {
+            let message = state.current_message().map_or_else(String::new, |index| {
+                format!(
+                    "Message {}/{} · {} · ",
+                    index + 1,
+                    state.messages.len(),
+                    state.messages[index].role
+                )
+            });
             let suffix = if state.right_query.is_some() && state.search_lines.is_empty() {
                 " · no matches"
             } else if state.right_query.is_some() {
@@ -1045,7 +1177,8 @@ fn draw(frame: &mut ratatui::Frame, state: &mut State) {
                 ""
             };
             format!(
-                "{} · record {} · source line {}{}",
+                "{}{} · record {} · source line {}{}",
+                message,
                 mode,
                 state.selected_entry().unwrap() + 1,
                 e.source_line,
@@ -1199,8 +1332,13 @@ fn draw(frame: &mut ratatui::Frame, state: &mut State) {
     } else if state.help {
         " Esc close help".to_string()
     } else {
+        let message_keys = if state.messages.is_empty() {
+            ""
+        } else {
+            "[ / ] messages · "
+        };
         format!(
-            " {}/{} rows · {} matches · r fields/raw │ Tab focus · j/k move · / search · ? help · q quit",
+            " {}/{} rows · {} matches · r fields/raw │ {message_keys}Tab focus · j/k move · / search · ? help · q quit",
             state.visible.len(),
             state.entries.len(),
             state
@@ -1224,7 +1362,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut State) {
             area.height.saturating_sub(4).min(18),
         );
         frame.render_widget(Clear, rect);
-        let manual = "Keys\n  Tab             Switch panels\n  j/k, ↑/↓        Select record or scroll inspector\n  PageUp/PageDown, Home/End\n  /               Search focused panel\n  Enter           Apply search; Esc cancels prompt\n  Esc             Clear active search\n  n/N             Next/previous matching row\n  r               Toggle Fields / Raw JSON\n  h/l or ←/→    Scroll horizontally in either view\n  ?               Toggle this manual    q / Ctrl-C quit\n  Help: j/k or PgUp/PgDn scroll\n\nSearch manual\n  Records searches raw JSONL records. Fields searches displayed keys and values.\n  Raw JSON searches the selected pretty-printed record.\n  Search is case-insensitive literal text, not a regex or JSON field query.\n  Enter applies; Esc cancels or clears. No-results can be cleared with Esc.";
+        let manual = "Keys\n  Tab             Switch panels\n  j/k, ↑/↓        Select record or scroll inspector\n  PageUp/PageDown, Home/End\n  /               Search focused panel\n  Enter           Apply search; Esc cancels prompt\n  Esc             Clear active search\n  n/N             Next/previous matching row\n  [ / ]           Previous/next trace message in Fields\n  r               Toggle Fields / Raw JSON\n  h/l or ←/→    Scroll horizontally in either view\n  ?               Toggle this manual    q / Ctrl-C quit\n  Help: j/k or PgUp/PgDn scroll\n\nSearch manual\n  Records searches raw JSONL records. Fields searches displayed keys and values.\n  Raw JSON searches the selected pretty-printed record.\n  Search is case-insensitive literal text, not a regex or JSON field query.\n  Enter applies; Esc cancels or clears. No-results can be cleared with Esc.";
         frame.render_widget(
             Paragraph::new(manual)
                 .scroll((state.help_scroll, 0))
@@ -1358,10 +1496,7 @@ fn handle(state: &mut State, file: &mut File, key: KeyEvent) -> Result<bool, Str
             if state.focus == Focus::List {
                 state.move_to(state.visible.len().saturating_sub(1))
             } else {
-                state.inspector_scroll = state
-                    .cached_lines
-                    .len()
-                    .saturating_sub(state.inspector_rows)
+                state.inspector_scroll = state.last_inspector_row();
             }
         }
         KeyCode::PageDown => {
@@ -1384,6 +1519,8 @@ fn handle(state: &mut State, file: &mut File, key: KeyEvent) -> Result<bool, Str
         }
         KeyCode::Char('n') => state.jump_match(true),
         KeyCode::Char('N') => state.jump_match(false),
+        KeyCode::Char('[') => state.jump_message(false),
+        KeyCode::Char(']') => state.jump_message(true),
         KeyCode::Char('r') => {
             state.raw_mode = !state.raw_mode;
             state.cached_entry = None;
@@ -1450,6 +1587,54 @@ pub fn run(path: &Path, color: bool) -> Result<(), String> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn jumps_between_trace_messages_without_scrolling_their_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        let record = serde_json::json!({
+            "metadata": {"message": {"role": "ignored"}},
+            "traces": [{"nodes": [
+                {"message": {"role": "user", "content": "wrapped content ".repeat(100)}},
+                {"message": {"role": "tool", "content": "done"}},
+            ]}],
+        });
+        std::fs::write(&path, format!("{record}\n{{}}\n")).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let mut state = State::new(&path, index_file(&path).unwrap(), false);
+        state.inspector_width = 72;
+        state.inspector_rows = 20;
+        state.update_selected(&mut file);
+        assert_eq!(state.messages.len(), 2);
+        let press = |state: &mut State, file: &mut File, key| {
+            handle(state, file, KeyEvent::new(key, KeyModifiers::NONE)).unwrap();
+        };
+
+        press(&mut state, &mut file, KeyCode::Char(']'));
+        assert_eq!(state.focus, Focus::Inspector);
+        assert_eq!(state.inspector_scroll, state.messages[0].row);
+        press(&mut state, &mut file, KeyCode::PageDown);
+        assert!(state.inspector_scroll > state.messages[0].row);
+        assert_eq!(state.current_message(), Some(0));
+        state.inspector_width = 45;
+        state.update_selected(&mut file);
+        assert_eq!(state.current_message(), Some(0));
+        press(&mut state, &mut file, KeyCode::Char(']'));
+        assert_eq!(state.inspector_scroll, state.messages[1].row);
+        assert_eq!(state.messages[1].role, "tool");
+        press(&mut state, &mut file, KeyCode::Char(']'));
+        assert_eq!(state.inspector_scroll, state.messages[1].row);
+        press(&mut state, &mut file, KeyCode::Char('['));
+        assert_eq!(state.inspector_scroll, state.messages[0].row);
+        press(&mut state, &mut file, KeyCode::Char('r'));
+        press(&mut state, &mut file, KeyCode::Char(']'));
+        assert!(state.raw_mode && state.messages.is_empty());
+        press(&mut state, &mut file, KeyCode::Char('r'));
+        press(&mut state, &mut file, KeyCode::Tab);
+        press(&mut state, &mut file, KeyCode::Char('j'));
+        assert_eq!(state.selected_entry(), Some(1));
+        assert!(state.messages.is_empty());
+    }
 
     #[test]
     fn renders_embedded_documents_and_preserves_raw_json() {

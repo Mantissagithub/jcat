@@ -42,6 +42,11 @@ const (
 
 type match struct{ line, column int }
 
+type messageAnchor struct {
+	row  int
+	role string
+}
+
 type model struct {
 	path                        string
 	file                        *os.File
@@ -63,6 +68,7 @@ type model struct {
 	cachedRaw                   bool
 	cachedEntry                 int
 	cachedLines                 []displayLine
+	messages                    []messageAnchor
 	cachedError                 string
 	matches                     []match
 	matchCursor                 int
@@ -205,6 +211,7 @@ func (m *model) loadSelected() {
 	if !ok {
 		m.cachedEntry = -1
 		m.cachedLines = nil
+		m.messages = nil
 		m.cachedError = ""
 		m.matches = nil
 		return
@@ -212,6 +219,13 @@ func (m *model) loadSelected() {
 	width := max(18, m.width*65/100-10)
 	if idx == m.cachedEntry && width == m.cachedWidth && m.rawMode == m.cachedRaw {
 		return
+	}
+	message, offset := -1, 0
+	if idx == m.cachedEntry && m.rawMode == m.cachedRaw {
+		message = m.currentMessage()
+		if message >= 0 {
+			offset = m.inspectorScroll - m.messages[message].row
+		}
 	}
 	e := m.entries[idx]
 	m.cachedLines = nil
@@ -243,7 +257,39 @@ func (m *model) loadSelected() {
 	m.cachedEntry = idx
 	m.cachedWidth = width
 	m.cachedRaw = m.rawMode
+	m.messages = m.messages[:0]
+	for row, line := range m.cachedLines {
+		if line.messageRole != "" {
+			m.messages = append(m.messages, messageAnchor{row: row, role: line.messageRole})
+		}
+	}
 	m.rebuildMatches()
+	if message >= 0 && message < len(m.messages) {
+		end := len(m.cachedLines)
+		if message+1 < len(m.messages) {
+			end = m.messages[message+1].row
+		}
+		m.inspectorScroll = min(m.messages[message].row+offset, end-1)
+		m.horizontal = 0
+	}
+}
+
+func (m *model) currentMessage() int {
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		if m.messages[i].row <= m.inspectorScroll {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *model) jumpMessage(delta int) {
+	index := m.currentMessage() + delta
+	if index >= 0 && index < len(m.messages) {
+		m.inspectorScroll = m.messages[index].row
+		m.horizontal = 0
+		m.focus = inspectorFocus
+	}
 }
 func (m *model) selectedEntry() (int, bool) {
 	if m.selected < 0 || m.selected >= len(m.visible) {
@@ -527,7 +573,7 @@ func (m *model) key(key string) {
 			m.horizontal = 0
 			m.loadSelected()
 		} else {
-			m.inspectorScroll = max(0, len(m.cachedLines)-m.inspectorRows)
+			m.inspectorScroll = m.lastInspectorRow()
 		}
 	case "pgdown":
 		if m.focus == listFocus {
@@ -545,6 +591,10 @@ func (m *model) key(key string) {
 		m.jumpMatch(true)
 	case "N":
 		m.jumpMatch(false)
+	case "[":
+		m.jumpMessage(-1)
+	case "]":
+		m.jumpMessage(1)
 	}
 	m.clampInspector()
 	m.cacheVisiblePreviews()
@@ -560,7 +610,14 @@ func (m *model) move(delta int) {
 	m.loadSelected()
 }
 func (m *model) clampInspector() {
-	m.inspectorScroll = max(0, min(m.inspectorScroll, max(0, len(m.cachedLines)-m.inspectorRows)))
+	m.inspectorScroll = max(0, min(m.inspectorScroll, m.lastInspectorRow()))
+}
+func (m *model) lastInspectorRow() int {
+	last := len(m.cachedLines) - m.inspectorRows
+	if len(m.messages) > 0 {
+		last = max(last, m.messages[len(m.messages)-1].row)
+	}
+	return max(0, last)
 }
 func (m *model) View() tea.View {
 	if m.width < 50 || m.height < 10 {
@@ -584,7 +641,11 @@ func (m *model) View() tea.View {
 	}
 	header := titleStyle(m.color).Render(" jcat  "+m.path) + "  " + badgeStyle(m.color).Render(mode)
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-	footer := fmt.Sprintf(" %d/%d rows · %d matches │ Tab focus · j/k move · h/l scroll · r fields/raw · / search · ? help · q quit", len(m.visible), len(m.entries), len(m.matches))
+	messageKeys := ""
+	if len(m.messages) > 0 {
+		messageKeys = "[ / ] messages · "
+	}
+	footer := fmt.Sprintf(" %d/%d rows · %d matches │ %sTab focus · j/k move · h/l scroll · r fields/raw · / search · ? help · q quit", len(m.visible), len(m.entries), len(m.matches), messageKeys)
 	if m.help {
 		footer = " Help: j/k or PgUp/PgDn scroll · q quit · Esc close"
 	}
@@ -599,7 +660,7 @@ func (m *model) View() tea.View {
 		content = lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
 	}
 	if m.help {
-		help := "KEYS\n  Tab             Switch panels\n  j/k, ↑/↓        Select record or scroll inspector\n  PageUp/PageDown, Home/End\n  /               Search focused panel with Huh input\n  Enter           Apply search; Esc cancels prompt\n  Esc             Clear the active search\n  n/N             Next/previous matching inspector row\n  h/l or ←/→     Scroll horizontally in raw mode\n  r               Toggle Fields / Raw JSON\n  q / Ctrl-C      Quit\n\nSEARCH MANUAL\n  Case-insensitive literal substring, not regex or JSON field query.\n  Records searches full raw JSONL records. Fields searches displayed keys and values.\n  Raw JSON searches the selected pretty-printed record.\n  Enter applies; Esc cancels or clears. No-results can be cleared with Esc."
+		help := "KEYS\n  Tab             Switch panels\n  j/k, ↑/↓        Select record or scroll inspector\n  PageUp/PageDown, Home/End\n  /               Search focused panel with Huh input\n  Enter           Apply search; Esc cancels prompt\n  Esc             Clear the active search\n  n/N             Next/previous matching inspector row\n  [ / ]           Previous/next trace message in Fields\n  h/l or ←/→     Scroll horizontally in raw mode\n  r               Toggle Fields / Raw JSON\n  q / Ctrl-C      Quit\n\nSEARCH MANUAL\n  Case-insensitive literal substring, not regex or JSON field query.\n  Records searches full raw JSONL records. Fields searches displayed keys and values.\n  Raw JSON searches the selected pretty-printed record.\n  Enter applies; Esc cancels or clears. No-results can be cleared with Esc."
 		hlines := strings.Split(help, "\n")
 		from := min(m.helpScroll, len(hlines))
 		to := min(from+max(1, bodyHeight-2), len(hlines))
@@ -653,6 +714,9 @@ func (m *model) rightPanel(width, height int) string {
 			mode = "Raw JSON"
 		}
 		title = fmt.Sprintf("%s · record %d · source line %d", mode, idx+1, m.entries[idx].sourceLine)
+		if message := m.currentMessage(); message >= 0 {
+			title = fmt.Sprintf("Message %d/%d · %s · %s", message+1, len(m.messages), m.messages[message].role, title)
+		}
 		if m.rightQuery != "" {
 			if len(m.matches) == 0 {
 				title += " · no matches"

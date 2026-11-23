@@ -49,16 +49,53 @@ const (
 )
 
 type displayLine struct {
-	depth      int
-	label      string
-	labelWidth int
-	value      string
-	styled     string
-	kind       lineKind
-	searchText string
-	sourceID   int
-	start      int
-	end        int
+	depth       int
+	label       string
+	labelWidth  int
+	value       string
+	styled      string
+	kind        lineKind
+	searchText  string
+	sourceID    int
+	start       int
+	end         int
+	messageRole string
+}
+
+type fieldPath uint8
+
+const (
+	otherField fieldPath = iota
+	recordObject
+	tracesArray
+	traceObject
+	nodesArray
+	traceNode
+	traceMessage
+)
+
+func (p fieldPath) field(key string) fieldPath {
+	switch {
+	case p == recordObject && key == "traces":
+		return tracesArray
+	case p == traceObject && key == "nodes":
+		return nodesArray
+	case p == traceNode && key == "message":
+		return traceMessage
+	default:
+		return otherField
+	}
+}
+
+func (p fieldPath) item() fieldPath {
+	switch p {
+	case tracesArray:
+		return traceObject
+	case nodesArray:
+		return traceNode
+	default:
+		return otherField
+	}
 }
 
 type wrapSegment struct {
@@ -141,17 +178,17 @@ func displayFields(raw []byte, width int) ([]displayLine, error) {
 		if len(n.fields) == 0 {
 			lines = append(lines, displayLine{value: "Empty object", kind: sectionLine})
 		} else {
-			appendFields(&lines, n.fields, 0, width, &sequence)
+			appendFields(&lines, n.fields, 0, width, &sequence, recordObject)
 		}
 	} else if n.kind == arrayNode {
-		appendValue(&lines, "Value", n, 0, 8, width, &sequence)
+		appendValue(&lines, "Value", n, 0, 8, width, &sequence, otherField)
 	} else {
-		appendValue(&lines, "Value", n, 0, 8, width, &sequence)
+		appendValue(&lines, "Value", n, 0, 8, width, &sequence, otherField)
 	}
 	return lines, nil
 }
 
-func appendFields(lines *[]displayLine, fields []jsonField, depth, width int, sequence *int) {
+func appendFields(lines *[]displayLine, fields []jsonField, depth, width int, sequence *int, path fieldPath) {
 	labelWidth := 0
 	for _, field := range fields {
 		labelWidth = max(labelWidth, lipgloss.Width(safeText(field.key)))
@@ -164,14 +201,14 @@ func appendFields(lines *[]displayLine, fields []jsonField, depth, width int, se
 				*sequence++
 				*lines = append(*lines, displayLine{depth: depth, label: segment.text, labelWidth: lipgloss.Width(segment.text), kind: keyLine, searchText: label, sourceID: *sequence, start: segment.start, end: segment.end})
 			}
-			appendValue(lines, "", field.value, depth, 0, width, sequence)
+			appendValue(lines, "", field.value, depth, 0, width, sequence, path.field(field.key))
 		} else {
-			appendValue(lines, label, field.value, depth, labelWidth, width, sequence)
+			appendValue(lines, label, field.value, depth, labelWidth, width, sequence, path.field(field.key))
 		}
 	}
 }
 
-func appendValue(lines *[]displayLine, label string, n *jsonNode, depth, labelWidth, width int, sequence *int) {
+func appendValue(lines *[]displayLine, label string, n *jsonNode, depth, labelWidth, width int, sequence *int, path fieldPath) {
 	indent := depth * 2
 	valueWidth := max(12, width-indent-labelWidth-4)
 	*sequence++
@@ -183,8 +220,17 @@ func appendValue(lines *[]displayLine, label string, n *jsonNode, depth, labelWi
 			return
 		}
 		value := fmt.Sprintf("Object · %d fields", len(n.fields))
-		*lines = append(*lines, displayLine{depth: depth, label: label, labelWidth: labelWidth, value: value, kind: sectionLine, searchText: value, sourceID: id, end: len(value)})
-		appendFields(lines, n.fields, depth+1, width, sequence)
+		line := displayLine{depth: depth, label: label, labelWidth: labelWidth, value: value, kind: sectionLine, searchText: value, sourceID: id, end: len(value)}
+		if path == traceMessage {
+			for _, field := range n.fields {
+				if field.key == "role" && field.value.kind == stringNode {
+					line.messageRole = strings.Join(strings.Fields(safeText(field.value.text)), " ")
+					break
+				}
+			}
+		}
+		*lines = append(*lines, line)
+		appendFields(lines, n.fields, depth+1, width, sequence, path)
 	case arrayNode:
 		if len(n.items) == 0 {
 			*lines = append(*lines, displayLine{depth: depth, label: label, labelWidth: labelWidth, value: "Empty array", kind: sectionLine, searchText: "Empty array", sourceID: id, end: len("Empty array")})
@@ -197,7 +243,7 @@ func appendValue(lines *[]displayLine, label string, n *jsonNode, depth, labelWi
 			itemWidth = max(itemWidth, len(fmt.Sprint(i+1)))
 		}
 		for i, item := range n.items {
-			appendValue(lines, fmt.Sprintf("%0*d", itemWidth, i+1), item, depth+1, itemWidth, width, sequence)
+			appendValue(lines, fmt.Sprintf("%0*d", itemWidth, i+1), item, depth+1, itemWidth, width, sequence, path.item())
 		}
 	case stringNode:
 		if n.text == "" {

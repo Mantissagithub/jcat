@@ -66,6 +66,63 @@ func TestFlagsAllowOptionsAfterFileAndHelp(t *testing.T) {
 	}
 }
 
+func TestInspectorJumpsBetweenTraceMessages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "trace.jsonl")
+	raw := `{"metadata":{"message":{"role":"ignored"}},"traces":[{"nodes":[{"message":{"role":"user","content":"` + strings.Repeat("wrapped content ", 100) + `"}},{"message":{"role":"tool","content":"done"}}]}]}`
+	if err := os.WriteFile(path, []byte(raw+"\n{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	entries, err := indexFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &model{file: file, entries: entries, visible: []int{0, 1}, cachedEntry: -1, width: 120, inspectorRows: 20, previews: map[int]string{}}
+	m.loadSelected()
+	if len(m.messages) != 2 {
+		t.Fatalf("expected two trace messages, got %v", m.messages)
+	}
+	m.key("]")
+	if m.focus != inspectorFocus || m.inspectorScroll != m.messages[0].row {
+		t.Fatal("first jump did not focus the first message")
+	}
+	m.key("pgdown")
+	if m.currentMessage() != 0 || m.inspectorScroll <= m.messages[0].row {
+		t.Fatal("expected to be partway through the first message")
+	}
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	if m.currentMessage() != 0 {
+		t.Fatal("resizing lost the current message")
+	}
+	m.key("]")
+	if m.inspectorScroll != m.messages[1].row || !strings.Contains(m.rightPanel(50, 24), "Message 2/2 · tool") {
+		t.Fatal("next jump did not show the final message at the top")
+	}
+	m.key("]")
+	if m.inspectorScroll != m.messages[1].row {
+		t.Fatal("jumping past the last message moved the inspector")
+	}
+	m.key("[")
+	if m.inspectorScroll != m.messages[0].row {
+		t.Fatal("previous jump did not return to the first message")
+	}
+	m.key("r")
+	m.key("]")
+	if !m.rawMode || len(m.messages) != 0 {
+		t.Fatal("message jumps should only appear in Fields view")
+	}
+	m.key("r")
+	m.key("tab")
+	m.key("j")
+	if len(m.messages) != 0 || m.selected != 1 {
+		t.Fatal("message positions leaked into the next record")
+	}
+}
+
 func TestIndexSummarySearchAndLongLineInspector(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "records.jsonl")

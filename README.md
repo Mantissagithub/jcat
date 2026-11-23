@@ -13,6 +13,8 @@ go build -trimpath -ldflags '-s -w' -o jcat-go .
 
 Both implementations render Markdown and XML inside JSONL string fields in the inspector. Fields with recognizable Markdown syntax show formatted headings, emphasis, lists, and code. Fields containing XML show highlighted tags and indented elements, with mixed text and `xml:space` preserved. Press `r` to inspect the original strings in raw JSON.
 
+For traces with messages at `traces[].nodes[].message`, press `]` or `[` in Fields view to jump to the next or previous message. The inspector header shows the current message number and role. `j` and `k` scroll within the inspector or select records, depending on which pane has focus.
+
 The Rust Ratatui implementation is available in [`rust/`](rust/). Build and run it with:
 
 ```sh
